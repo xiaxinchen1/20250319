@@ -1,0 +1,128 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+from copy import deepcopy
+from PIL import Image, ImageOps
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torchvision import transforms, models
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, average_precision_score
+
+# ---------- Dataset ----------
+class EyeDataset(Dataset):
+    def __init__(self, df, left_dir, right_dir, transform=None, size=224):
+        self.df = df.reset_index(drop=True)
+        self.left_dir = left_dir
+        self.right_dir = right_dir
+        self.transform = transform
+        self.size = size
+
+    def __len__(self):
+
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        left = Image.open(os.path.join(self.left_dir, row['Left-Fundus'])).convert('RGB')
+        right = Image.open(os.path.join(self.right_dir, row['Right-Fundus'])).convert('RGB')
+        combined = Image.new('RGB', (left.width+right.width, max(left.height, right.height)))
+        combined.paste(left, (0,0)); combined.paste(right, (left.width,0))
+        combined = self.crop_black(combined).resize((self.size,self.size))
+        if self.transform: combined = self.transform(combined)
+        labels = torch.tensor(row[['N','D','G','C','A','H','M','O']].values.astype(np.float32))
+        return combined, labels
+
+    def crop_black(self, img):
+        arr = np.array(img); mask = np.any(arr>10,axis=2)
+        coords = np.argwhere(mask)
+        if coords.size:
+            y0,x0 = coords.min(axis=0); y1,x1 = coords.max(axis=0)
+            return Image.fromarray(arr[y0:y1+1,x0:x1+1])
+        return img
+
+# ---------- Augmentations ----------
+train_transform = transforms.Compose([
+    transforms.RandomHorizontalFlip(), transforms.RandomRotation(10),
+    transforms.ColorJitter(0.1,0.1), transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
+val_transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])])
+
+def mixup(images, labels, alpha=0.4):
+    lam = np.random.beta(alpha,alpha)
+    idx = torch.randperm(images.size(0))
+    mixed = lam*images + (1-lam)*images[idx]
+    return mixed, lam*labels + (1-lam)*labels[idx]
+
+def cutmix(images, labels, alpha=0.4):
+    lam = np.random.beta(alpha,alpha)
+    idx = torch.randperm(images.size(0))
+    B,C,H,W = images.size(); cut_rat = np.sqrt(1-lam)
+    cut_w,cut_h = int(W*cut_rat), int(H*cut_rat)
+    cx,cy = np.random.randint(W), np.random.randint(H)
+    x0,y0 = max(cx-cut_w//2,0), max(cy-cut_h//2,0)
+    x1,y1 = min(cx+cut_w//2,W), min(cy+cut_h//2,H)
+    images[:,:,y0:y1,x0:x1] = images[idx,:,y0:y1,x0:x1]
+    lam = 1 - ((x1-x0)*(y1-y0)/(W*H))
+    return images, lam*labels + (1-lam)*labels[idx]
+
+# ---------- Model ----------
+class ResNet50Multi(nn.Module):
+    def __init__(self, num_classes=8):
+        super().__init__()
+        self.net = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+        self.net.fc = nn.Linear(self.net.fc.in_features, num_classes)
+    def forward(self,x): return self.net(x)
+
+# ---------- Training ----------
+def train():
+    df = pd.read_excel(r"F:\desktop\Traning_Dataset.xlsx")
+    train_df, val_df = train_test_split(df,test_size=0.2,random_state=42)
+    left_dir, right_dir = r"F:\desktop\left", r"F:\desktop\right"
+    train_ds = EyeDataset(train_df,left_dir,right_dir,train_transform)
+    val_ds   = EyeDataset(val_df,left_dir,right_dir,val_transform)
+
+    labels_arr = train_df[['N','D','G','C','A','H','M','O']].values
+    counts = labels_arr.sum(axis=0); N=len(train_ds)
+    pos_w = torch.tensor([(N-c)/max(c,1) for c in counts])
+    sample_w = [(torch.max(pos_w[labels.astype(bool)]) if labels.sum()>0 else 1.0) for labels in labels_arr]
+    sampler = WeightedRandomSampler(sample_w,len(sample_w),replacement=True)
+    train_loader = DataLoader(train_ds,batch_size=32,sampler=sampler,num_workers=4)
+    val_loader   = DataLoader(val_ds,batch_size=32,shuffle=False,num_workers=4)
+
+    model = ResNet50Multi().to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w.to(device))
+    optimizer = optim.AdamW(model.parameters(),lr=1e-4,weight_decay=1e-2)
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer,max_lr=1e-3,epochs=20,steps_per_epoch=len(train_loader))
+
+    best_f1,patience_cnt=0,0
+    for epoch in range(20):
+        model.train(); total=0
+        for imgs,labels in train_loader:
+            imgs,labels=imgs.to(device),labels.to(device)
+            if random.random()<0.5: imgs,labels = mixup(imgs,labels)
+            optimizer.zero_grad(); out=model(imgs)
+            loss=criterion(out,labels); loss.backward(); optimizer.step(); scheduler.step()
+            total+=loss.item()*imgs.size(0)
+        val_probs,val_targs=[],[]
+        model.eval()
+        with torch.no_grad():
+            for imgs,labels in val_loader:
+                imgs=imgs.to(device); out=model(imgs)
+                val_probs.append(torch.sigmoid(out).cpu().numpy()); val_targs.append(labels.numpy())
+        probs=np.vstack(val_probs); targs=np.vstack(val_targs)
+        preds=(probs>=0.5).astype(int)
+        f1= f1_score(targs,preds,average='macro',zero_division=0)
+        print(f"Epoch {epoch+1} Macro-F1: {f1:.4f}")
+        if f1>best_f1: best_f1,patience_cnt=f1,0; best_weights=deepcopy(model.state_dict())
+        else: patience_cnt+=1
+        if patience_cnt>=5: break
+    model.load_state_dict(best_weights)
+
+if __name__=='__main__': device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'); train()
