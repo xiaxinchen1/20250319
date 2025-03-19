@@ -1,128 +1,239 @@
-import os
-import random
+# -*- coding: utf-8 -*-
+import cv2
 import numpy as np
+from PIL import Image
 import pandas as pd
-from copy import deepcopy
-from PIL import Image, ImageOps
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torchvision import transforms, models
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report, roc_auc_score
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, average_precision_score
 
-# ---------- Dataset ----------
-class EyeDataset(Dataset):
-    def __init__(self, df, left_dir, right_dir, transform=None, size=224):
-        self.df = df.reset_index(drop=True)
-        self.left_dir = left_dir
-        self.right_dir = right_dir
+# ---------------------------
+# 1. 设备配置：自动选择 GPU 或 CPU
+# ---------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("使用设备：", device)
+
+# ---------------------------
+# 2. 数据预处理函数：增强眼底图像对比度
+# ---------------------------
+def enhance_fundus_image(img: Image.Image) -> Image.Image:
+    """
+    对输入的眼底图像进行 CLAHE 增强，改善亮度不均问题
+    """
+    # 转换为 LAB 颜色空间
+    lab = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2LAB)
+    L, A, B = cv2.split(lab)
+    # 应用 CLAHE 到明度通道
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    L_enhanced = clahe.apply(L)
+    lab_enhanced = cv2.merge((L_enhanced, A, B))
+    # 转换回 RGB 空间
+    img_enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
+    return Image.fromarray(img_enhanced)
+
+# ---------------------------
+# 3. 数据集类：读取双目眼底图像及标签
+# ---------------------------
+class FundusPairDataset(Dataset):
+    def __init__(self, df, transform=None):
+        """
+        df: 包含图像路径和标签的信息表，列名必须包括 'left_eye_path', 'right_eye_path', 'label'
+        transform: 对图像的预处理转换，例如增强、缩放等
+        """
+        self.left_paths = df["left_eye_path"].tolist()
+        self.right_paths = df["right_eye_path"].tolist()
+        self.labels = df["label"].tolist()
         self.transform = transform
-        self.size = size
 
     def __len__(self):
-
-        return len(self.df)
+        return len(self.labels)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        left = Image.open(os.path.join(self.left_dir, row['Left-Fundus'])).convert('RGB')
-        right = Image.open(os.path.join(self.right_dir, row['Right-Fundus'])).convert('RGB')
-        combined = Image.new('RGB', (left.width+right.width, max(left.height, right.height)))
-        combined.paste(left, (0,0)); combined.paste(right, (left.width,0))
-        combined = self.crop_black(combined).resize((self.size,self.size))
-        if self.transform: combined = self.transform(combined)
-        labels = torch.tensor(row[['N','D','G','C','A','H','M','O']].values.astype(np.float32))
-        return combined, labels
+        # 读取左右眼图像，确保转换为 RGB 模式
+        left_img = Image.open(self.left_paths[idx]).convert('RGB')
+        right_img = Image.open(self.right_paths[idx]).convert('RGB')
+        # 可先应用图像增强（CLAHE），再进行 transform 预处理
+        left_img = enhance_fundus_image(left_img)
+        right_img = enhance_fundus_image(right_img)
+        if self.transform:
+            left_img = self.transform(left_img)
+            right_img = self.transform(right_img)
+        label = self.labels[idx]
+        return left_img, right_img, label
 
-    def crop_black(self, img):
-        arr = np.array(img); mask = np.any(arr>10,axis=2)
-        coords = np.argwhere(mask)
-        if coords.size:
-            y0,x0 = coords.min(axis=0); y1,x1 = coords.max(axis=0)
-            return Image.fromarray(arr[y0:y1+1,x0:x1+1])
-        return img
+# ---------------------------
+# 4. 数据加载与 DataLoader 构造
+# ---------------------------
+# 4.1 读取 Excel 数据，注意文件路径格式
+excel_path = r"F:\desktop\Traning_Dataset.xlsx"
+df = pd.read_excel(excel_path)
 
-# ---------- Augmentations ----------
-train_transform = transforms.Compose([
-    transforms.RandomHorizontalFlip(), transforms.RandomRotation(10),
-    transforms.ColorJitter(0.1,0.1), transforms.ToTensor(),
-    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+# 4.2 数据集拆分：例如按 80% 训练，20% 测试拆分
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+
+# 4.3 图像预处理转换
+# 为满足 Inception_v3 输入要求，统一调整图像尺寸到 299x299
+transform = transforms.Compose([
+    transforms.Resize((299, 299)),
+    transforms.ToTensor(),
+    # ImageNet 均值和标准差
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
 ])
-val_transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])])
 
-def mixup(images, labels, alpha=0.4):
-    lam = np.random.beta(alpha,alpha)
-    idx = torch.randperm(images.size(0))
-    mixed = lam*images + (1-lam)*images[idx]
-    return mixed, lam*labels + (1-lam)*labels[idx]
+# 4.4 创建数据集实例并构造 DataLoader
+train_dataset = FundusPairDataset(train_df, transform=transform)
+test_dataset = FundusPairDataset(test_df, transform=transform)
 
-def cutmix(images, labels, alpha=0.4):
-    lam = np.random.beta(alpha,alpha)
-    idx = torch.randperm(images.size(0))
-    B,C,H,W = images.size(); cut_rat = np.sqrt(1-lam)
-    cut_w,cut_h = int(W*cut_rat), int(H*cut_rat)
-    cx,cy = np.random.randint(W), np.random.randint(H)
-    x0,y0 = max(cx-cut_w//2,0), max(cy-cut_h//2,0)
-    x1,y1 = min(cx+cut_w//2,W), min(cy+cut_h//2,H)
-    images[:,:,y0:y1,x0:x1] = images[idx,:,y0:y1,x0:x1]
-    lam = 1 - ((x1-x0)*(y1-y0)/(W*H))
-    return images, lam*labels + (1-lam)*labels[idx]
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4)
+test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, num_workers=4)
 
-# ---------- Model ----------
-class ResNet50Multi(nn.Module):
-    def __init__(self, num_classes=8):
-        super().__init__()
-        self.net = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-        self.net.fc = nn.Linear(self.net.fc.in_features, num_classes)
-    def forward(self,x): return self.net(x)
+print("训练集样本数：", len(train_dataset))
+print("测试集样本数：", len(test_dataset))
 
-# ---------- Training ----------
-def train():
-    df = pd.read_excel(r"F:\desktop\Traning_Dataset.xlsx")
-    train_df, val_df = train_test_split(df,test_size=0.2,random_state=42)
-    left_dir, right_dir = r"F:\desktop\left", r"F:\desktop\right"
-    train_ds = EyeDataset(train_df,left_dir,right_dir,train_transform)
-    val_ds   = EyeDataset(val_df,left_dir,right_dir,val_transform)
+# ---------------------------
+# 5. 模型定义
+# ---------------------------
+# 5.1 示例模型 1：TwoEyesNet
+# 使用预训练 ResNet50 作为骨干，左右眼分支共享同一权重
+resnet_backbone = models.resnet50(pretrained=True)
+resnet_backbone = nn.Sequential(*list(resnet_backbone.children())[:-1])  # 去掉全连接层
 
-    labels_arr = train_df[['N','D','G','C','A','H','M','O']].values
-    counts = labels_arr.sum(axis=0); N=len(train_ds)
-    pos_w = torch.tensor([(N-c)/max(c,1) for c in counts])
-    sample_w = [(torch.max(pos_w[labels.astype(bool)]) if labels.sum()>0 else 1.0) for labels in labels_arr]
-    sampler = WeightedRandomSampler(sample_w,len(sample_w),replacement=True)
-    train_loader = DataLoader(train_ds,batch_size=32,sampler=sampler,num_workers=4)
-    val_loader   = DataLoader(val_ds,batch_size=32,shuffle=False,num_workers=4)
+class TwoEyesNet(nn.Module):
+    def __init__(self, backbone, feature_dim: int, num_classes: int):
+        super(TwoEyesNet, self).__init__()
+        self.backbone = backbone
+        self.classifier = nn.Linear(feature_dim * 2, num_classes)
 
-    model = ResNet50Multi().to(device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w.to(device))
-    optimizer = optim.AdamW(model.parameters(),lr=1e-4,weight_decay=1e-2)
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer,max_lr=1e-3,epochs=20,steps_per_epoch=len(train_loader))
+    def forward(self, left_img, right_img):
+        feat_left = self.backbone(left_img)   # 输出形状 [B, feature_dim, 1, 1]
+        feat_right = self.backbone(right_img)
+        feat_left = feat_left.view(feat_left.size(0), -1)
+        feat_right = feat_right.view(feat_right.size(0), -1)
+        fused_feat = torch.cat([feat_left, feat_right], dim=1)
+        logits = self.classifier(fused_feat)
+        return logits
 
-    best_f1,patience_cnt=0,0
-    for epoch in range(20):
-        model.train(); total=0
-        for imgs,labels in train_loader:
-            imgs,labels=imgs.to(device),labels.to(device)
-            if random.random()<0.5: imgs,labels = mixup(imgs,labels)
-            optimizer.zero_grad(); out=model(imgs)
-            loss=criterion(out,labels); loss.backward(); optimizer.step(); scheduler.step()
-            total+=loss.item()*imgs.size(0)
-        val_probs,val_targs=[],[]
-        model.eval()
-        with torch.no_grad():
-            for imgs,labels in val_loader:
-                imgs=imgs.to(device); out=model(imgs)
-                val_probs.append(torch.sigmoid(out).cpu().numpy()); val_targs.append(labels.numpy())
-        probs=np.vstack(val_probs); targs=np.vstack(val_targs)
-        preds=(probs>=0.5).astype(int)
-        f1= f1_score(targs,preds,average='macro',zero_division=0)
-        print(f"Epoch {epoch+1} Macro-F1: {f1:.4f}")
-        if f1>best_f1: best_f1,patience_cnt=f1,0; best_weights=deepcopy(model.state_dict())
-        else: patience_cnt+=1
-        if patience_cnt>=5: break
-    model.load_state_dict(best_weights)
+# two_eyes_model = TwoEyesNet(resnet_backbone, feature_dim=2048, num_classes=8)
+# 注意：该模型为双分支模型，左右图像单独输入
 
-if __name__=='__main__': device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'); train()
+# 5.2 示例模型 2：MultiModelFusionNet（多模型融合）
+# 本示例中采用左右眼图像拼接后输入，利用 ResNet50、MobileNet_v3_large 和 Inception_v3 融合特征
+class MultiModelFusionNet(nn.Module):
+    def __init__(self, model_list: list, feature_dims: list, num_classes: int):
+        """
+        model_list: 包含多个预训练模型（去掉全连接层），每个模型输出一个特征向量
+        feature_dims: 每个模型输出的特征维度列表
+        num_classes: 分类类别数（本项目为8类）
+        """
+        super(MultiModelFusionNet, self).__init__()
+        self.models = nn.ModuleList(model_list)
+        self.classifier = nn.Linear(sum(feature_dims), num_classes)
+
+    def forward(self, x):
+        """
+        x: 单一张量输入，通常将左右眼图像沿宽度方向拼接，
+           形状为 [B, 3, H, 2*W]
+        """
+        feats = []
+        for mdl in self.models:
+            f = mdl(x)
+            f = f.view(f.size(0), -1)
+            feats.append(f)
+        fused_feat = torch.cat(feats, dim=1)
+        return self.classifier(fused_feat)
+
+# 初始化各预训练模型
+# ResNet50
+resnet = models.resnet50(pretrained=True)
+resnet = nn.Sequential(*list(resnet.children())[:-1])
+# MobileNet_v3_large（仅取 features 部分，并加上自适应池化层）
+mobilenet = models.mobilenet_v3_large(pretrained=True).features
+mobilenet_pool = nn.AdaptiveAvgPool2d((1,1))
+mobilenet = nn.Sequential(mobilenet, mobilenet_pool)
+# Inception_v3（禁用辅助分类器）
+inception = models.inception_v3(pretrained=True, aux_logits=False)
+inception = nn.Sequential(*list(inception.children())[:-1])
+
+model_fusion = MultiModelFusionNet(
+    model_list=[resnet, mobilenet, inception],
+    feature_dims=[2048, 1280, 2048],
+    num_classes=8
+)
+model_fusion.to(device)
+
+# ---------------------------
+# 6. 训练设置与训练循环
+# ---------------------------
+# 此处简单设定类别权重为 1，如有需要可根据训练数据计算
+class_weights = torch.ones(8).to(device)
+criterion = nn.CrossEntropyLoss(weight=class_weights)
+optimizer = torch.optim.Adam(model_fusion.parameters(), lr=1e-4)
+num_epochs = 50
+
+for epoch in range(num_epochs):
+    model_fusion.train()
+    running_loss = 0.0
+    for left_imgs, right_imgs, labels in train_loader:
+        left_imgs, right_imgs = left_imgs.to(device), right_imgs.to(device)
+        labels = labels.to(device)
+        # 拼接左右眼图像（沿宽度方向），输入尺寸从 [B, 3, H, W] -> [B, 3, H, 2*W]
+        inputs = torch.cat([left_imgs, right_imgs], dim=3)
+        outputs = model_fusion(inputs)
+        loss = criterion(outputs, labels)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item() * inputs.size(0)
+    epoch_loss = running_loss / len(train_dataset)
+    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}")
+    # 此处可添加验证步骤监控模型表现
+    model_fusion.eval()
+    # ... 验证代码略
+
+# ---------------------------
+# 7. 模型评估
+# ---------------------------
+model_fusion.eval()
+y_true, y_pred = [], []
+with torch.no_grad():
+    for left_imgs, right_imgs, labels in test_loader:
+        inputs = torch.cat([left_imgs, right_imgs], dim=3)
+        outputs = model_fusion(inputs)
+        preds = outputs.argmax(dim=1).cpu().numpy()
+        y_pred.extend(preds)
+        y_true.extend(labels.cpu().numpy())
+y_true = np.array(y_true)
+y_pred = np.array(y_pred)
+
+# 7.1 混淆矩阵
+class_names = ["Normal", "Diabetic", "Glaucoma", "Cataract", "AMD", "Hypertension", "Myopia", "Other"]
+cm = confusion_matrix(y_true, y_pred, labels=list(range(8)))
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+disp.plot(include_values=True, cmap="Blues", xticks_rotation=45)
+plt.title("Confusion Matrix")
+plt.show()
+
+# 7.2 分类报告
+print(classification_report(y_true, y_pred, target_names=class_names))
+
+# 7.3 ROC-AUC 计算
+y_true_onehot = np.eye(8)[y_true]
+model_probs = []
+with torch.no_grad():
+    for left_imgs, right_imgs, labels in test_loader:
+        inputs = torch.cat([left_imgs, right_imgs], dim=3)
+        probs = torch.softmax(model_fusion(inputs), dim=1)
+        model_probs.append(probs.cpu().numpy())
+model_probs = np.vstack(model_probs)
+for i, cls in enumerate(class_names):
+    auc = roc_auc_score(y_true_onehot[:, i], model_probs[:, i])
+    print(f"{cls} AUC: {auc:.3f}")
+macro_auc = roc_auc_score(y_true_onehot, model_probs, average="macro")
+print(f"Macro-AUC: {macro_auc:.3f}")
