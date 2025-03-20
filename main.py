@@ -177,17 +177,18 @@ def train_and_evaluate():
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}")
 
     # 评估过程
+       # 评估过程
     model_fusion.eval()
     y_true, y_pred = [], []
     with torch.no_grad():
         for left_imgs, right_imgs, labels in test_loader:
+            left_imgs, right_imgs = left_imgs.to(device), right_imgs.to(device)
             inputs = torch.cat([left_imgs, right_imgs], dim=3)
             outputs = model_fusion(inputs)
             preds = outputs.argmax(dim=1).cpu().numpy()
             y_pred.extend(preds)
             y_true.extend(labels.cpu().numpy())
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
+
 
     class_names = ["Normal", "Diabetic", "Glaucoma", "Cataract", "AMD", "Hypertension", "Myopia", "Other"]
     cm = confusion_matrix(y_true, y_pred, labels=list(range(8)))
