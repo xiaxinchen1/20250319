@@ -178,40 +178,34 @@ def train_and_evaluate():
 
     # 评估过程
        # 评估过程
+       # 评估过程（只进行一次评估）
     model_fusion.eval()
     y_true, y_pred = [], []
     with torch.no_grad():
         for left_imgs, right_imgs, labels in test_loader:
+            # 将数据移到 GPU 上
             left_imgs, right_imgs = left_imgs.to(device), right_imgs.to(device)
+            labels = labels.to(device)
             inputs = torch.cat([left_imgs, right_imgs], dim=3)
             outputs = model_fusion(inputs)
             preds = outputs.argmax(dim=1).cpu().numpy()
             y_pred.extend(preds)
             y_true.extend(labels.cpu().numpy())
 
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
 
-    class_names = ["Normal", "Diabetic", "Glaucoma", "Cataract", "AMD", "Hypertension", "Myopia", "Other"]
-    cm = confusion_matrix(y_true, y_pred, labels=list(range(8)))
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
-    disp.plot(include_values=True, cmap="Blues", xticks_rotation=45)
-    plt.title("Confusion Matrix")
-    plt.show()
-
-    print(classification_report(y_true, y_pred, target_names=class_names))
-
+    # 计算预测概率时，也确保将输入移动到 GPU
     y_true_onehot = np.eye(8)[y_true]
     model_probs = []
     with torch.no_grad():
         for left_imgs, right_imgs, labels in test_loader:
+            left_imgs, right_imgs = left_imgs.to(device), right_imgs.to(device)
             inputs = torch.cat([left_imgs, right_imgs], dim=3)
             probs = torch.softmax(model_fusion(inputs), dim=1)
             model_probs.append(probs.cpu().numpy())
     model_probs = np.vstack(model_probs)
-    for i, cls in enumerate(class_names):
-        auc = roc_auc_score(y_true_onehot[:, i], model_probs[:, i])
-        print(f"{cls} AUC: {auc:.3f}")
-    macro_auc = roc_auc_score(y_true_onehot, model_probs, average="macro")
-    print(f"Macro-AUC: {macro_auc:.3f}")
+
 
 if __name__ == '__main__':
     # Windows 下多进程 DataLoader 需放在 main 函数中启动
