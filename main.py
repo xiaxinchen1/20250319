@@ -58,11 +58,11 @@ class FundusPairDataset(Dataset):
 
 # 4. 数据加载与 DataLoader 构造
 def prepare_dataloaders():
-    excel_path = r"F:\desktop\Traning_Dataset.xlsx"
+    excel_path = "/home/ubuntu/data/Traning_Dataset.xlsx"
     df = pd.read_excel(excel_path)
     # 构造左右眼图像完整路径（根据实际存放位置修改）
-    df['left_eye_path'] = r"F:\desktop\left\\" + df['Left-Fundus'].astype(str)
-    df['right_eye_path'] = r"F:\desktop\right\\" + df['Right-Fundus'].astype(str)
+    df['left_eye_path'] = "/home/ubuntu/data/left/" + df['Left-Fundus'].astype(str)
+    df['right_eye_path'] = "/home/ubuntu/data/right/" + df['Right-Fundus'].astype(str)
     # 根据后面 8 列 (N, D, G, C, A, H, M, O) 得到标签，假设只有一列为 1
     df['label'] = df[['N', 'D', 'G', 'C', 'A', 'H', 'M', 'O']].values.argmax(axis=1)
     # 拆分训练集和测试集
