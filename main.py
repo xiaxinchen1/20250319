@@ -11,7 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report, roc_auc_score
 from sklearn.model_selection import train_test_split
-from torchvision.models import Inception_V3_Weights
+from torchvision.models import Inception_V3_Weights, ResNet18_Weights
 
 # 1. 设备配置：自动选择 GPU 或 CPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -58,7 +58,7 @@ class FundusPairDataset(Dataset):
 
 # 4. 数据加载与 DataLoader 构造
 def prepare_dataloaders():
-    excel_path = "/home/ubuntu/data/Traning_Dataset.xlsx"  # 修改为你的数据路径
+    excel_path = "/home/ubuntu/data/Traning_Dataset.xlsx"  # 请根据实际路径修改
     df = pd.read_excel(excel_path)
     # 构造左右眼图像完整路径（根据实际存放位置修改）
     df['left_eye_path'] = "/home/ubuntu/data/left/" + df['Left-Fundus'].astype(str)
@@ -123,25 +123,19 @@ class InceptionWrapper(nn.Module):
             out = self.avgpool(out)
         return out
 
-# 7. 构建多模型融合网络：包含 ResNet50、MobileNet_v3_large 和 Inception 三个分支
+# 7. 构建多模型融合网络：包含 ResNet18 和 Inception 两个分支
 def build_model():
-    # ResNet50 分支
-    resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-    resnet = nn.Sequential(*list(resnet.children())[:-1])  # 输出：[B, 2048, 1, 1]
-
-    # MobileNet_v3_large 分支：取 features 部分并加自适应池化层
-    mobilenet = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.IMAGENET1K_V1).features
-    mobilenet_pool = nn.AdaptiveAvgPool2d((1, 1))
-    mobilenet = nn.Sequential(mobilenet, mobilenet_pool)  # 输出：[B, 960, 1, 1]
-    # 注意：实际输出通道为 960，而非 1280
+    # ResNet18 分支
+    resnet = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+    resnet = nn.Sequential(*list(resnet.children())[:-1])  # 输出：[B, 512, 1, 1]
 
     # Inception 分支使用包装器
     inception = InceptionWrapper()  # 输出：[B, 2048, 1, 1]
 
-    # 构造融合模型，调整 feature_dims 为 [2048, 960, 2048]，总计 5056
+    # 构造融合模型，更新 feature_dims 为 [512, 2048]，总计 2560
     model_fusion = MultiModelFusionNet(
-        model_list=[resnet, mobilenet, inception],
-        feature_dims=[2048, 960, 2048],
+        model_list=[resnet, inception],
+        feature_dims=[512, 2048],
         num_classes=8
     )
     model_fusion.to(device)
@@ -156,7 +150,7 @@ def train_and_evaluate():
     class_weights = torch.ones(8).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model_fusion.parameters(), lr=1e-4)
-    num_epochs = 25
+    num_epochs = 50
 
     # 训练过程
     for epoch in range(num_epochs):
@@ -165,7 +159,7 @@ def train_and_evaluate():
         for left_imgs, right_imgs, labels in train_loader:
             left_imgs, right_imgs = left_imgs.to(device), right_imgs.to(device)
             labels = labels.to(device)
-            # 拼接左右眼图像（沿宽度方向）：输入尺寸由 [B, 3, 299, 299] 变为 [B, 3, 299, 598]
+            # 拼接左右眼图像（沿宽度方向），输入尺寸由 [B, 3, 299, 299] 变为 [B, 3, 299, 598]
             inputs = torch.cat([left_imgs, right_imgs], dim=3)
             outputs = model_fusion(inputs)
             loss = criterion(outputs, labels)
