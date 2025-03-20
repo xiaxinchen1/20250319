@@ -58,7 +58,7 @@ class FundusPairDataset(Dataset):
 
 # 4. 数据加载与 DataLoader 构造
 def prepare_dataloaders():
-    excel_path = "/home/ubuntu/data/Traning_Dataset.xlsx"
+    excel_path = "/home/ubuntu/data/Traning_Dataset.xlsx"  # 修改为你的数据路径
     df = pd.read_excel(excel_path)
     # 构造左右眼图像完整路径（根据实际存放位置修改）
     df['left_eye_path'] = "/home/ubuntu/data/left/" + df['Left-Fundus'].astype(str)
@@ -69,7 +69,7 @@ def prepare_dataloaders():
     train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
 
     transform = transforms.Compose([
-        transforms.Resize((299, 299)),  # 统一调整为 299x299 以满足 Inception 要求
+        transforms.Resize((299, 299)),  # 统一调整为 299x299 以满足 Inception 模型要求
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
@@ -138,7 +138,7 @@ def build_model():
     # Inception 分支使用包装器
     inception = InceptionWrapper()  # 输出：[B, 2048, 1, 1]
 
-    # 构造融合模型，调整 feature_dims 为 [2048, 960, 2048]
+    # 构造融合模型，调整 feature_dims 为 [2048, 960, 2048]，总计 5056
     model_fusion = MultiModelFusionNet(
         model_list=[resnet, mobilenet, inception],
         feature_dims=[2048, 960, 2048],
@@ -165,7 +165,7 @@ def train_and_evaluate():
         for left_imgs, right_imgs, labels in train_loader:
             left_imgs, right_imgs = left_imgs.to(device), right_imgs.to(device)
             labels = labels.to(device)
-            # 拼接左右眼图像（沿宽度方向），使输入尺寸由 [B, 3, 299, 299] 变为 [B, 3, 299, 598]
+            # 拼接左右眼图像（沿宽度方向）：输入尺寸由 [B, 3, 299, 299] 变为 [B, 3, 299, 598]
             inputs = torch.cat([left_imgs, right_imgs], dim=3)
             outputs = model_fusion(inputs)
             loss = criterion(outputs, labels)
@@ -176,36 +176,41 @@ def train_and_evaluate():
         epoch_loss = running_loss / len(train_loader.dataset)
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}")
 
-    # 评估过程
-       # 评估过程
-       # 评估过程（只进行一次评估）
+    # 评估过程：单次遍历测试集，收集预测结果、标签和预测概率
     model_fusion.eval()
-    y_true, y_pred = [], []
+    y_true, y_pred, all_probs = [], [], []
     with torch.no_grad():
         for left_imgs, right_imgs, labels in test_loader:
-            # 将数据移到 GPU 上
             left_imgs, right_imgs = left_imgs.to(device), right_imgs.to(device)
             labels = labels.to(device)
             inputs = torch.cat([left_imgs, right_imgs], dim=3)
             outputs = model_fusion(inputs)
-            preds = outputs.argmax(dim=1).cpu().numpy()
-            y_pred.extend(preds)
+            probs = torch.softmax(outputs, dim=1)
+            preds = outputs.argmax(dim=1)
+            y_pred.extend(preds.cpu().numpy())
             y_true.extend(labels.cpu().numpy())
-
+            all_probs.append(probs.cpu().numpy())
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
+    all_probs = np.vstack(all_probs)
 
-    # 计算预测概率时，也确保将输入移动到 GPU
+    # 显示混淆矩阵和分类报告
+    class_names = ["Normal", "Diabetic", "Glaucoma", "Cataract", "AMD", "Hypertension", "Myopia", "Other"]
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(8)))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    disp.plot(include_values=True, cmap="Blues", xticks_rotation=45)
+    plt.title("Confusion Matrix")
+    plt.show()
+
+    print(classification_report(y_true, y_pred, target_names=class_names))
+
+    # 计算 ROC-AUC
     y_true_onehot = np.eye(8)[y_true]
-    model_probs = []
-    with torch.no_grad():
-        for left_imgs, right_imgs, labels in test_loader:
-            left_imgs, right_imgs = left_imgs.to(device), right_imgs.to(device)
-            inputs = torch.cat([left_imgs, right_imgs], dim=3)
-            probs = torch.softmax(model_fusion(inputs), dim=1)
-            model_probs.append(probs.cpu().numpy())
-    model_probs = np.vstack(model_probs)
-
+    for i, cls in enumerate(class_names):
+        auc = roc_auc_score(y_true_onehot[:, i], all_probs[:, i])
+        print(f"{cls} AUC: {auc:.3f}")
+    macro_auc = roc_auc_score(y_true_onehot, all_probs, average="macro")
+    print(f"Macro-AUC: {macro_auc:.3f}")
 
 if __name__ == '__main__':
     # Windows 下多进程 DataLoader 需放在 main 函数中启动
