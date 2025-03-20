@@ -58,7 +58,7 @@ class FundusPairDataset(Dataset):
 
 # 4. 数据加载与 DataLoader 构造
 def prepare_dataloaders():
-    excel_path = "/home/ubuntu/data/Traning_Dataset.xlsx"  # 请根据实际路径修改
+   excel_path = "/home/ubuntu/data/Traning_Dataset.xlsx"  # 请根据实际路径修改
     df = pd.read_excel(excel_path)
     # 构造左右眼图像完整路径（根据实际存放位置修改）
     df['left_eye_path'] = "/home/ubuntu/data/left/" + df['Left-Fundus'].astype(str)
@@ -123,7 +123,7 @@ class InceptionWrapper(nn.Module):
             out = self.avgpool(out)
         return out
 
-# 7. 构建多模型融合网络：包含 ResNet18 和 Inception 两个分支
+# 7. 构建多模型融合网络：只包含 ResNet18 和 Inception 两个分支
 def build_model():
     # ResNet18 分支
     resnet = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
@@ -159,7 +159,7 @@ def train_and_evaluate():
         for left_imgs, right_imgs, labels in train_loader:
             left_imgs, right_imgs = left_imgs.to(device), right_imgs.to(device)
             labels = labels.to(device)
-            # 拼接左右眼图像（沿宽度方向），输入尺寸由 [B, 3, 299, 299] 变为 [B, 3, 299, 598]
+            # 拼接左右眼图像（沿宽度方向），使输入尺寸由 [B, 3, 299, 299] 变为 [B, 3, 299, 598]
             inputs = torch.cat([left_imgs, right_imgs], dim=3)
             outputs = model_fusion(inputs)
             loss = criterion(outputs, labels)
@@ -175,6 +175,7 @@ def train_and_evaluate():
     y_true, y_pred, all_probs = [], [], []
     with torch.no_grad():
         for left_imgs, right_imgs, labels in test_loader:
+            # 将数据移到 GPU 上
             left_imgs, right_imgs = left_imgs.to(device), right_imgs.to(device)
             labels = labels.to(device)
             inputs = torch.cat([left_imgs, right_imgs], dim=3)
