@@ -156,7 +156,7 @@ def train_and_evaluate():
     class_weights = torch.ones(8).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model_fusion.parameters(), lr=1e-4)
-    num_epochs = 50
+    num_epochs = 25
 
     # 训练过程
     for epoch in range(num_epochs):
